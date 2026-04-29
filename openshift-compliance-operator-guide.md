@@ -524,6 +524,245 @@ oc get compliancecheckresults -n openshift-compliance \
 
 ---
 
+### Step 7.8 — Understand Check Result Statuses Before Remediating
+
+Every `ComplianceCheckResult` has one of four statuses. Knowing which you have determines your remediation path:
+
+| Status | Meaning | Action |
+|---|---|---|
+| `PASS` | Check satisfied | None |
+| `FAIL` | Check failed — a `ComplianceRemediation` *may* exist | Apply remediation or fix manually (see 7.9–7.11) |
+| `MANUAL` | No remediation object will ever be created | Human review required (see 7.12) |
+| `INFO` / `NOT-APPLICABLE` | Informational or scoped out for this platform | No action |
+
+```bash
+# Count results by status
+oc get compliancecheckresults -n openshift-compliance \
+  -o jsonpath='{range .items[*]}{.metadata.labels.compliance\.openshift\.io/check-status}{"\n"}{end}' \
+  | sort | uniq -c
+
+# List MANUAL checks (require human action — no remediation object will be created)
+oc get compliancecheckresults -n openshift-compliance \
+  -l compliance.openshift.io/check-status=MANUAL \
+  -o custom-columns=NAME:.metadata.name,SEVERITY:.metadata.labels.compliance\.openshift\.io/check-severity
+
+# Find FAILs that have NO remediation object (need a manual fix)
+comm -23 \
+  <(oc get compliancecheckresults -n openshift-compliance \
+      -l compliance.openshift.io/check-status=FAIL \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort) \
+  <(oc get complianceremediations -n openshift-compliance \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+```
+
+---
+
+### Step 7.9 — Common FAIL: Kernel / sysctl Parameter Checks
+
+Sysctl failures are among the most frequent CIS/STIG findings. The operator creates a `MachineConfig` when a remediation object exists; if none exists, create one manually.
+
+**Example failing checks:**
+- `ocp4-cis-node-worker-sysctl-net-ipv4-conf-all-accept-redirects`
+- `ocp4-cis-node-worker-sysctl-net-ipv4-conf-default-send-redirects`
+- `ocp4-stig-worker-sysctl-kernel-dmesg-restrict`
+
+```bash
+# Step 1 — check if a remediation object exists
+oc get complianceremediation -n openshift-compliance | grep sysctl
+
+# Step 2 — apply it (this creates a MachineConfig and triggers a rolling reboot)
+oc patch complianceremediation <remediation-name> \
+  -n openshift-compliance \
+  --type merge -p '{"spec":{"apply":true}}'
+
+oc get mcp -w   # wait for UPDATED=True, DEGRADED=False
+```
+
+If no remediation object exists, create the MachineConfig directly:
+
+```yaml
+# sysctl-hardening.yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 75-sysctl-hardening
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/sysctl.d/75-compliance.conf
+          mode: 0644
+          contents:
+            source: "data:,net.ipv4.conf.all.accept_redirects%3D0%0Anet.ipv4.conf.default.send_redirects%3D0%0Akernel.dmesg_restrict%3D1%0A"
+```
+
+```bash
+oc apply -f sysctl-hardening.yaml
+oc get mcp -w
+```
+
+---
+
+### Step 7.10 — Common FAIL: File Permission / Ownership Checks
+
+Many CIS checks fail because kubeconfig, audit log, or kubelet config files have overly permissive modes.
+
+**Example failing checks:**
+- `ocp4-cis-node-worker-file-permissions-kubeconfig`
+- `ocp4-cis-node-master-file-permissions-etcd-data-dir`
+- `ocp4-stig-worker-file-owner-kube-apiserver`
+
+```bash
+# Identify the exact path and expected permissions from the check description
+oc describe compliancecheckresult <check-name> -n openshift-compliance \
+  | grep -A5 "Description"
+
+# Inspect current permissions on the node (investigation only — not persistent)
+oc debug node/<node-name> -- chroot /host stat /etc/kubernetes/kubeconfig
+```
+
+Fix persistently via MachineConfig (survives reboots and re-provisions):
+
+```yaml
+# file-perms-fix.yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 75-file-perms-fix
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/kubernetes/kubeconfig
+          mode: 0600
+          user:
+            name: root
+          group:
+            name: root
+```
+
+```bash
+oc apply -f file-perms-fix.yaml
+oc get mcp -w
+```
+
+---
+
+### Step 7.11 — Common FAIL: Kubelet Configuration Checks
+
+Kubelet checks require a `KubeletConfig` object; do **not** edit kubelet flags directly or they will be overwritten by MCO.
+
+**Example failing checks:**
+- `ocp4-cis-node-worker-kubelet-anonymous-auth`
+- `ocp4-cis-node-worker-kubelet-authorization-mode-webhook`
+- `ocp4-cis-node-worker-kubelet-protect-kernel-defaults`
+- `ocp4-stig-worker-kubelet-enable-streaming-connections-timeout`
+
+```bash
+# Check if a remediation object exists and apply it
+oc get complianceremediation -n openshift-compliance | grep kubelet
+
+oc patch complianceremediation <remediation-name> \
+  -n openshift-compliance \
+  --type merge -p '{"spec":{"apply":true}}'
+
+oc get mcp -w
+```
+
+If no remediation object exists, create a `KubeletConfig`:
+
+```yaml
+# kubelet-hardening.yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: compliance-kubelet-hardening
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/worker: ""
+  kubeletConfig:
+    anonymousAuth: false
+    authorization:
+      mode: Webhook
+    protectKernelDefaults: true
+    streamingConnectionIdleTimeout: "5m"
+```
+
+```bash
+oc apply -f kubelet-hardening.yaml
+oc get mcp -w   # triggers a rolling node reboot
+```
+
+Verify the settings landed on a node after rollout:
+
+```bash
+oc debug node/<node-name> -- chroot /host \
+  cat /etc/kubernetes/kubelet.conf \
+  | grep -E "anonymousAuth|authorization|protectKernel|streamingConnection"
+```
+
+---
+
+### Step 7.12 — MANUAL Checks: Handling Checks With No Remediation
+
+`MANUAL` checks require a human to evaluate and provide evidence. The operator never creates a `ComplianceRemediation` for them.
+
+```bash
+# List all MANUAL checks with severity
+oc get compliancecheckresults -n openshift-compliance \
+  -l compliance.openshift.io/check-status=MANUAL \
+  -o custom-columns=\
+NAME:.metadata.name,\
+SEVERITY:.metadata.labels.compliance\.openshift\.io/check-severity,\
+RULE:.metadata.labels.compliance\.openshift\.io/check-rule
+```
+
+**Common MANUAL check categories and verification commands:**
+
+| Check pattern | Verification command |
+|---|---|
+| `*-accounts-*-password*` | `oc debug node/<name> -- chroot /host grep -E "^[^:]+:[^\!*]" /etc/shadow` |
+| `*-audit-for-*` | `oc get apiservers cluster -o yaml \| grep -A10 audit` |
+| `*-configure-network-policies*` | `oc get netpol -A` |
+| `*-rbac-limit-*` | `oc get clusterrolebindings -o wide` |
+| `*-etcd-*-encryption*` | `oc get apiserver cluster -o jsonpath='{.spec.encryption}'` |
+| `*-pod-security*` | `oc get ns -o custom-columns=NAME:.metadata.name,PSA:.metadata.labels.pod-security\.kubernetes\.io/enforce` |
+
+Once verified, document acceptance in a `TailoredProfile` so future scans reflect your decision:
+
+```yaml
+# tailored-profile-manual-accept.yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: TailoredProfile
+metadata:
+  name: cis-manual-accepted
+  namespace: openshift-compliance
+spec:
+  extends: ocp4-cis
+  title: "CIS with accepted manual controls"
+  setValues: []
+  disabledRules:
+    - name: ocp4-cis-configure-network-policies
+      rationale: "NetworkPolicies verified manually on 2026-04-29; documented in audit log."
+```
+
+```bash
+oc apply -f tailored-profile-manual-accept.yaml
+```
+
+> **Note:** Disabling a rule suppresses it from scan results. Use only for controls you have genuinely verified or accepted with documented rationale.
+
+---
+
 ## 8. Common Errors and Fixes
 
 | Symptom | Cause | Fix |
@@ -536,6 +775,9 @@ oc get compliancecheckresults -n openshift-compliance \
 | Remediations created but scan still FAIL | MachineConfig not applied yet | Wait for MCP rollout, then rescan |
 | `compliancecheckresults` empty after DONE | Aggregator pod failed | Check aggregator pod logs |
 | Suite phase never changes from `Pending` | ScanSettingBinding misconfigured | Check `settingsRef.name` matches ScanSetting name exactly |
+| Remediation applied but MCP stuck `DEGRADED` | MachineConfig conflict between remediations | `oc describe mcp worker` to find conflicting MC; `oc get mc` to review duplicate keys |
+| Check still FAIL after MCP rollout completes | kubelet not yet restarted on the node | `oc debug node/<name> -- chroot /host systemctl restart kubelet` then rescan |
+| No `ComplianceRemediation` exists for a FAIL check | Check is `MANUAL` or operator provides no fix | See Step 7.12 — apply fix manually via MachineConfig or KubeletConfig |
 
 ---
 
