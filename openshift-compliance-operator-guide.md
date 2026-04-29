@@ -396,25 +396,92 @@ oc cp openshift-compliance/result-extractor:/results ./compliance-results/
 oc delete pod result-extractor -n openshift-compliance
 ```
 
-### Option C: Use oc-compliance plugin (recommended for HTML reports)
+### Option C: Generate an HTML Report
+
+HTML reports are human-readable, shareable with auditors, and show pass/fail details with
+rule descriptions and remediation guidance inline.
+
+#### Step C.1 — Fetch the raw ARF results
+
+Use the `oc-compliance` plugin to pull the result files from the PVCs onto your local machine:
 
 ```bash
-# Install the plugin if not present
+# Install the plugin if not already present
 # Download from: https://github.com/openshift/oc-compliance/releases
-# Place binary in your PATH
+# Place the binary in your PATH, e.g.:
+#   mv oc-compliance-linux-amd64 /usr/local/bin/oc-compliance
+#   chmod +x /usr/local/bin/oc-compliance
 
-# Fetch results as a tar archive
+# Fetch all raw ARF result files for a ScanSettingBinding
 oc compliance fetch-raw scansettingbindings my-scan-binding \
   -o ./my-compliance-results \
   -n openshift-compliance
 
-# The archive contains ARF XML files which can be opened with:
-# - OpenSCAP oscap tool
-# - SCAP Workbench (GUI)
-# - https://github.com/ComplianceAsCode/content
+# Results land at: ./my-compliance-results/<scan-name>/<node>.xml
+ls ./my-compliance-results/
+```
 
-# Generate HTML report from ARF (requires oscap installed locally)
-oscap xccdf generate report <arf-result-file.xml> > report.html
+Each `.xml` file is an ARF (Assessment Results Format) document — the input for `oscap`.
+
+#### Step C.2 — Generate HTML from each ARF file
+
+Requires `openscap` installed locally (`dnf install openscap-scanner` on RHEL/Fedora,
+`apt install libopenscap8` on Debian/Ubuntu):
+
+```bash
+# Generate an HTML report from a single ARF file
+oscap xccdf generate report \
+  ./my-compliance-results/<scan-name>/<node>.xml \
+  > ./report-<node>.html
+
+# Batch — generate one report per result file
+for arf in ./my-compliance-results/**/*.xml; do
+  node=$(basename "$arf" .xml)
+  oscap xccdf generate report "$arf" > "./report-${node}.html"
+  echo "Generated report-${node}.html"
+done
+```
+
+The HTML file is self-contained (no external assets) and can be emailed or attached to a ticket.
+
+#### Step C.3 — View the report
+
+Open directly in a browser:
+
+```bash
+# Linux
+xdg-open report-<node>.html
+
+# macOS
+open report-<node>.html
+```
+
+Or serve over HTTP to share with the team without sending files:
+
+```bash
+# Python 3 — serves current directory on port 8080
+python3 -m http.server 8080 --directory .
+# Open http://localhost:8080/report-<node>.html in a browser
+```
+
+#### What the HTML report contains
+
+- **Score** — overall percentage of passing rules
+- **Rule results** — each check listed as PASS / FAIL / NOTSELECTED with severity badge
+- **Rule descriptions** — what the check validates and why it matters
+- **Fix text** — the remediation instructions embedded from the SCAP content
+- **Identifiers** — CCE, CVE, and STIG IDs cross-referenced per rule
+
+#### Alternative: SCAP Workbench (GUI)
+
+If you prefer a graphical viewer, SCAP Workbench can open ARF files directly:
+
+```bash
+# Install
+dnf install scap-workbench   # RHEL/Fedora
+
+# Open an ARF file
+scap-workbench ./my-compliance-results/<scan-name>/<node>.xml
 ```
 
 ---
